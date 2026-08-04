@@ -14,8 +14,10 @@ a = Analysis(
     [os.path.join(ROOT, "run.py")],
     pathex=[os.path.join(ROOT, "src")],
     binaries=[],
+    # assets/ carries the DINOv2 ONNX model as well as the icon artwork, so
+    # the exe stays a single self-contained file with nothing to download.
     datas=[(ASSETS, "assets")],
-    hiddenimports=[],
+    hiddenimports=["onnxruntime", "onnxruntime.capi.onnxruntime_pybind11_state"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -43,7 +45,13 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    # UPX mangles onnxruntime's native libraries - the packed DLL loads but
+    # fails at session creation - so leave those alone and let it compress the
+    # rest.
+    upx_exclude=[
+        "onnxruntime*.dll", "onnxruntime_pybind11_state*.pyd",
+        "DirectML.dll", "vcruntime140*.dll", "msvcp140*.dll",
+    ],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

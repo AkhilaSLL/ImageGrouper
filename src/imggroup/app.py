@@ -161,8 +161,9 @@ class App(tk.Tk):
             pass
         ttk.Label(header, text="  Image Grouper",
                   style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="groups images that look alike  ·  copies them "
-                              "out renamed, never moves or deletes",
+        ttk.Label(header, text="groups images into albums by what is in them"
+                              "  ·  copies them out renamed, never moves or "
+                              "deletes",
                   style="WindowMuted.TLabel").pack(side="left",
                                                    padx=self._px(14))
 

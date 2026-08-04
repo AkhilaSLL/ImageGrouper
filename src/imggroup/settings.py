@@ -13,8 +13,11 @@ FILE_NAME = "settings.json"
 
 MIN_THRESHOLD = 40
 MAX_THRESHOLD = 100
-DEFAULT_THRESHOLD = 75          # see probe/ - above the worst false pairs
-                                # measured, below the weakest real ones
+# Chosen by running the real clustering over a labelled benchmark at every
+# setting and scoring the groups it produced against the true albums: pairwise
+# F1 peaks at 70% (0.535, against 0.459 at 75% and 0.446 at 60%).  See
+# probe/threshold.py - re-run it rather than nudging this by feel.
+DEFAULT_THRESHOLD = 70
 
 
 @dataclass

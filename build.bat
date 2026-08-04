@@ -41,11 +41,22 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4/5] Generating app icon...
+echo [4/6] Generating app icon...
 if not exist "assets\app.ico" "%PY%" scripts\make_icon.py
 
 echo.
-echo [5/5] Building ImageGrouper.exe ...
+echo [5/6] Checking the bundled vision model...
+if not exist "assets\dinov2-small-uint8.onnx" (
+    echo  ERROR: assets\dinov2-small-uint8.onnx is missing.
+    echo  It ships in the repository - re-clone, or fetch it with:
+    echo    git checkout -- assets/dinov2-small-uint8.onnx
+    echo  Building without it produces an .exe that cannot analyse anything.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [6/6] Building ImageGrouper.exe ...
 "%PY%" -m PyInstaller --noconfirm --clean ^
     --distpath dist --workpath build ^
     packaging\ImageGrouper.spec

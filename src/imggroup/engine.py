@@ -1,27 +1,33 @@
 """
 Grouping engine - pure logic, no GUI, independently testable.
 
-Every image is reduced to four independent blocks, each of which yields a
-distance in ``[0, 1]``:
+Every image becomes one unit-length 384-dimensional vector from DINOv2-small
+(see :mod:`imggroup.embedder`, which records why that model and that recipe).
+Similarity between two images is the cosine between their vectors, rescaled so
+the slider spans a range that is actually reachable::
 
-===========  ==========================================================
-``struct``   dHash (64 bits) + DCT hash (256 bits).  Shape and edges.
-``layout``   8x8 CIELAB thumbnail.  Where the colours sit in the frame.
-``detail``   12x12 map of local luminance spread.  Where the busy parts are.
-``palette``  Saturation-weighted hue histogram + tone histogram.  What
-             colours the picture is made of, ignoring where they are.
-===========  ==========================================================
+    similarity = clip((cos - COSINE_FLOOR) / (1 - COSINE_FLOOR), 0, 1)
+    distance   = 1 - similarity
 
-They combine as a weighted mean of squares, so the overall distance also
-lands in ``[0, 1]`` and ``similarity = 100 * (1 - distance)``::
+**The rescale is the whole point of COSINE_FLOOR, and it is the bug that broke
+the previous version.**  That one weighted a perceptual-hash block at 0.26 of
+the squared distance - but measured over real photographs the block sat between
+0.64 and 0.75 for every pair of *distinct* pictures, near-constant.  A constant
+term inside a square root is a floor on the distance, so::
 
-    d^2 = Ws*ds^2 + Wl*dl^2 + Wd*dd^2 + Wp*dp^2
+    d >= sqrt(0.26 * 0.687^2) = 0.350   ->   similarity <= 65%
 
-The weights are not guesses - see ``probe/`` in the repository, where each
-block was measured on real photographs against re-encodes, reframings of one
-scene, unrelated pictures, and (the case that forced ``detail`` and the
-256-bit DCT hash to exist) near-uniform content like scanned pages and UI
-screenshots, where colour says almost nothing.
+which meant nothing but a byte-identical duplicate could ever score above 65%,
+the top third of the slider was unreachable, and at any usable setting the only
+block still varying was colour - so unrelated pictures that shared a colour cast
+grouped while the same scene shot twice did not.  Measured over 210 real pairs,
+exactly 2 reached 75%: the two identical files.
+
+The floor here is measured rather than assumed: over the benchmark in
+``probe/bench.py`` unrelated pairs have median cosine 0.317 and same-album pairs
+median 0.826, so 0.30 puts unrelated pairs at roughly 0% and same-album pairs
+around 75%.  ``test_similarity_scale_is_reachable`` pins it so the failure
+cannot come back silently.
 
 Grouping is average-linkage agglomerative clustering.  Single-link chaining -
 which is what plain union-find gives you - would merge A and C whenever some B
@@ -46,6 +52,8 @@ from typing import Protocol
 import numpy as np
 from PIL import Image, ImageFile, ImageOps
 
+from .embedder import BATCH_SIZE, EMBED_DIM, Embedder, preprocess, shared
+
 # Slightly damaged JPEGs are common in real image dumps; decode what we can
 # instead of discarding the file.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -55,35 +63,11 @@ IMAGE_EXTS = frozenset({
     ".tif", ".tiff", ".webp", ".ppm", ".pgm", ".tga",
 })
 
-# ---- descriptor geometry -------------------------------------------------- #
-DHASH_SIZE = 8                       # -> 8*8  = 64 bits
-DCT_SIZE = 32                        # DCT input resolution
-PHASH_KEEP = 16                      # -> 16*16 = 256 bits of low frequencies
-STRUCT_BITS = DHASH_SIZE * DHASH_SIZE + PHASH_KEEP * PHASH_KEEP      # 320
-STRUCT_WORDS = STRUCT_BITS // 64                                     # 5
+# Cosine below this counts as "no more alike than two unrelated pictures".
+# Measured, not chosen - see the module docstring and probe/calibrate2.py.
+COSINE_FLOOR = 0.30
 
-LAYOUT_GRID = 8                      # 8*8*3 = 192 floats
-DETAIL_GRID = 12                     # 12*12 = 144 floats
-DETAIL_CELL = 16                     # pixels per detail cell
-HUE_BINS = 12
-TONE_BINS = 4                        # separately for saturation and value
-HUE_SHARE = 0.6                      # hue vs tone split inside the palette
-PALETTE_SIZE = 64                    # working resolution for the histograms
-
-LAYOUT_DIMS = LAYOUT_GRID * LAYOUT_GRID * 3
-DETAIL_DIMS = DETAIL_GRID * DETAIL_GRID
-PALETTE_DIMS = HUE_BINS + 2 * TONE_BINS
-FEATURE_DIMS = LAYOUT_DIMS + DETAIL_DIMS + PALETTE_DIMS
-
-# ---- block weights (shares of the squared distance; must sum to 1) -------- #
-W_STRUCT = 0.26
-W_LAYOUT = 0.30
-W_DETAIL = 0.26
-W_PALETTE = 0.18
-
-# libjpeg can decode at 1/2, 1/4 or 1/8 scale for free.  The finest thing the
-# descriptor looks at is a 192px detail map, so a 256px draft costs nothing.
-_DRAFT_TARGET = 256
+FEATURE_BYTES = EMBED_DIM * 2            # float16 per dimension in the cache
 
 # Ceiling on retained near pairs, so a hopelessly loose threshold on a huge
 # folder degrades into "fewer links found" rather than into swap death.  Each
@@ -110,8 +94,7 @@ class CachedFeatures:
     key: str                     # normcase(abspath(path))
     size: int
     mtime_ns: int
-    bits: bytes                  # STRUCT_BITS packed big-endian
-    features: bytes              # FEATURE_DIMS bytes, each a quantised 0..1
+    features: bytes              # EMBED_DIM float16 values
 
 
 class CacheLike(Protocol):
@@ -134,8 +117,7 @@ class ImgInfo:
     path: str
     size: int
     mtime: float
-    bits: np.ndarray = field(repr=False)          # (STRUCT_WORDS,) uint64
-    features: np.ndarray = field(repr=False)      # (FEATURE_DIMS,) float32
+    features: np.ndarray = field(repr=False)      # (EMBED_DIM,) unit float32
     group: int = 0                                # 1-based group number
     index: int = 0                                # 1-based position in group
     match: float = 0.0                            # % similar to the exemplar
@@ -181,160 +163,42 @@ def human_size(n: float) -> str:
 #  Fingerprinting
 # --------------------------------------------------------------------------- #
 
-def _dct_matrix(n: int) -> np.ndarray:
-    """Orthonormal DCT-II basis, so ``M @ x @ M.T`` is a 2-D DCT."""
-    k = np.arange(n)
-    basis = np.cos(np.pi * (2 * k[None, :] + 1) * k[:, None] / (2 * n))
-    basis[0] *= 1.0 / np.sqrt(2.0)
-    return basis * np.sqrt(2.0 / n)
+IMAGE_DRAFT = 448        # two model tiles, so a draft decode never undershoots
 
 
-_DCT = _dct_matrix(DCT_SIZE)
-
-# sRGB -> XYZ (D65), and the D65 white point.
-_RGB_TO_XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
-                        [0.2126729, 0.7151522, 0.0721750],
-                        [0.0193339, 0.1191920, 0.9503041]])
-_D65 = np.array([0.95047, 1.00000, 1.08883])
-
-
-def srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
-    """``(..., 3)`` sRGB in 0..255 -> ``(..., 3)`` CIELAB (D65 white point)."""
-    c = np.asarray(rgb, dtype=np.float64) / 255.0
-    linear = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    t = (linear @ _RGB_TO_XYZ.T) / _D65
-    delta = 6.0 / 29.0
-    f = np.where(t > delta ** 3, np.cbrt(t), t / (3 * delta ** 2) + 4.0 / 29.0)
-    fx, fy, fz = f[..., 0], f[..., 1], f[..., 2]
-    return np.stack([116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)], axis=-1)
-
-
-def dhash_bits(gray: Image.Image) -> np.ndarray:
-    """Horizontal gradient hash: is each pixel brighter than its neighbour?"""
-    img = gray.resize((DHASH_SIZE + 1, DHASH_SIZE), Image.Resampling.LANCZOS)
-    px = np.asarray(img, dtype=np.int16)
-    return (px[:, 1:] > px[:, :-1]).ravel()
-
-
-def phash_bits(gray: Image.Image) -> np.ndarray:
-    """
-    DCT hash over the low ``PHASH_KEEP`` x ``PHASH_KEEP`` frequencies.
-
-    The usual 8x8 / 64-bit version describes only the coarsest structure, and
-    measurement showed it cannot tell two different scanned pages apart.
-    Keeping 16x16 costs 24 more bytes per image and roughly halves that error.
-    """
-    img = gray.resize((DCT_SIZE, DCT_SIZE), Image.Resampling.LANCZOS)
-    coefficients = _DCT @ np.asarray(img, dtype=np.float64) @ _DCT.T
-    low = coefficients[:PHASH_KEEP, :PHASH_KEEP].ravel()
-    return low > np.median(low)
-
-
-def layout_vector(rgb: Image.Image) -> np.ndarray:
-    """Mean CIELAB colour of each cell of an 8x8 grid, scaled to 0..1."""
-    small = rgb.resize((LAYOUT_GRID, LAYOUT_GRID), Image.Resampling.BOX)
-    lab = srgb_to_lab(np.asarray(small))
-    lab[..., 0] /= 100.0                          # L is 0..100
-    lab[..., 1:] = (lab[..., 1:] + 110.0) / 220.0  # a/b are about -110..110
-    return np.clip(lab, 0.0, 1.0).ravel()
-
-
-def detail_vector(gray: Image.Image) -> np.ndarray:
-    """
-    How much local contrast each cell of the frame carries.
-
-    A mean colour map cannot see the difference between two scanned pages:
-    both are white nearly everywhere, and the sparse text that distinguishes
-    them barely moves any cell's average.  Its *spread* moves a great deal.
-    """
-    side = DETAIL_GRID * DETAIL_CELL
-    px = np.asarray(gray.resize((side, side), Image.Resampling.BOX),
-                    dtype=np.float64)
-    cells = px.reshape(DETAIL_GRID, DETAIL_CELL,
-                       DETAIL_GRID, DETAIL_CELL).swapaxes(1, 2)
-    spread = cells.reshape(DETAIL_GRID, DETAIL_GRID, -1).std(axis=-1)
-    return np.clip(spread / 64.0, 0.0, 1.0).ravel()
-
-
-def _spread_hist(values: np.ndarray, bins: int, weights: np.ndarray,
-                 circular: bool) -> np.ndarray:
-    """
-    Histogram with each sample split between its two neighbouring bins.
-
-    Hard binning is brittle: a hue drifting across a bin edge moves all of its
-    mass at once, so two shots of one scene can end up as far apart as two
-    unrelated pictures.  Interpolating removes that cliff.
-    """
-    pos = values * bins - 0.5
-    lo = np.floor(pos).astype(np.int64)
-    frac = pos - lo
-    out = np.zeros(bins)
-    for index, weight in ((lo, 1.0 - frac), (lo + 1, frac)):
-        index = np.mod(index, bins) if circular else np.clip(index, 0, bins - 1)
-        np.add.at(out, index, weight * weights)
-    return out
-
-
-def palette_vector(rgb: Image.Image) -> np.ndarray:
-    """
-    Which colours the picture is made of, as a Hellinger-embeddable vector.
-
-    Hue is weighted by saturation and brightness so a near-grey picture cannot
-    vote loudly for whatever arbitrary hue its noise lands on.  Taking the
-    square root of the probabilities means plain Euclidean distance between
-    two of these *is* the Hellinger distance between the distributions.
-    """
-    small = rgb.resize((PALETTE_SIZE, PALETTE_SIZE), Image.Resampling.BOX)
-    hsv = np.asarray(small.convert("HSV"), dtype=np.float64) / 255.0
-    h, s, v = hsv[..., 0].ravel(), hsv[..., 1].ravel(), hsv[..., 2].ravel()
-
-    hue = _spread_hist(h, HUE_BINS, s * v, circular=True)
-    hue /= max(1e-9, hue.sum())
-
-    ones = np.ones_like(s)
-    tone = np.concatenate([_spread_hist(s, TONE_BINS, ones, circular=False),
-                           _spread_hist(v, TONE_BINS, ones, circular=False)])
-    tone /= max(1e-9, tone.sum())
-
-    return np.sqrt(np.concatenate([HUE_SHARE * hue, (1 - HUE_SHARE) * tone]))
-
-
-def pack_bits(bits: np.ndarray) -> np.ndarray:
-    """Boolean bit array -> ``(STRUCT_WORDS,)`` uint64 for fast popcounting."""
-    return np.packbits(bits).view(np.uint64)
-
-
-def fingerprint(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(bits, features)`` for the image at ``path``."""
+def load_for_embedding(path: str) -> np.ndarray:
+    """Decode ``path`` and return the model's ``(3, 224, 224)`` input."""
     with Image.open(path) as im:
-        # No-op unless the codec supports it (JPEG does, PNG does not).
+        # No-op unless the codec supports it (JPEG does, PNG does not).  The
+        # model only ever sees 224px, so decoding a 24 MP original in full is
+        # pure waste.
         with contextlib.suppress(AttributeError, ValueError, OSError):
-            im.draft("RGB", (_DRAFT_TARGET, _DRAFT_TARGET))
+            im.draft("RGB", (IMAGE_DRAFT, IMAGE_DRAFT))
         # EXIF orientation is honoured because it decides how the picture
         # *looks*; no other metadata is consulted anywhere in this module.
         oriented = ImageOps.exif_transpose(im) or im
-        rgb = oriented.convert("RGB")
-        gray = rgb.convert("L")
-
-        bits = pack_bits(np.concatenate([dhash_bits(gray), phash_bits(gray)]))
-        features = np.concatenate([layout_vector(rgb), detail_vector(gray),
-                                   palette_vector(rgb)]).astype(np.float32)
-        return bits, features
+        return preprocess(oriented.convert("RGB"))
 
 
-def quantise(features: np.ndarray) -> bytes:
-    """Features -> one byte per dimension, for the cache.
+def fingerprint(path: str, embedder: Embedder | None = None) -> np.ndarray:
+    """The embedding for a single image.  Convenience for tests and scripts."""
+    batch = load_for_embedding(path)[None, ...]
+    return (embedder or shared()).embed(batch)[0]
 
-    Every block is already scaled to 0..1, so a byte carries the value to
-    about 0.002 - two orders of magnitude finer than the distances that decide
-    a grouping.
+
+def pack_features(features: np.ndarray) -> bytes:
     """
-    return np.clip(np.rint(np.asarray(features) * 255.0),
-                   0, 255).astype(np.uint8).tobytes()
+    Embedding -> cache bytes.
+
+    float16 keeps ~3 significant digits over a unit-length vector, which moves
+    a cosine by well under 0.001 - two orders of magnitude below the gap that
+    decides any grouping - at half the size of float32.
+    """
+    return np.asarray(features, dtype=np.float16).tobytes()
 
 
-def dequantise(raw: bytes) -> np.ndarray:
-    return np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 255.0
+def unpack_features(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw, dtype=np.float16).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -387,10 +251,15 @@ def scan_images(
     cancel: threading.Event | None = None,
     workers: int | None = None,
     cache: CacheLike | None = None,
+    embedder: Embedder | None = None,
 ) -> tuple[list[ImgInfo], list[tuple[str, str]]]:
     """
     Describe every path.  Returns ``(infos, errors)``, where ``errors`` holds
     ``(path, message)`` for files that could not be read.
+
+    Decoding runs on a thread pool while the model runs on the calling thread;
+    the pool is kept one batch ahead so the two overlap.  Decoding is only
+    about a tenth of the cost, so there is little more to win there.
 
     ``size`` and ``mtime`` are recorded for the cache's staleness check and for
     display only - neither ever reaches :func:`group_images`.
@@ -405,64 +274,88 @@ def scan_images(
         except OSError as exc:
             errors.append((path, str(exc)))
 
-    todo = list(stats)
-    total = len(todo)
-
+    total = len(stats)
     cached: dict[str, CachedFeatures] = {}
     if cache is not None:
         with contextlib.suppress(Exception):   # a cache is only ever a speedup
-            cached = cache.load(todo)
+            cached = cache.load(list(stats))
 
-    fresh: dict[str, CachedFeatures] = {}
-    fresh_lock = threading.Lock()
-
-    def work(path: str) -> ImgInfo:
-        st = stats[path]
+    infos: list[ImgInfo] = []
+    todo: list[str] = []
+    for path, st in stats.items():
         hit = cached.get(os.path.normcase(os.path.abspath(path)))
         if (hit is not None and hit.size == st.st_size
                 and hit.mtime_ns == st.st_mtime_ns
-                and len(hit.features) == FEATURE_DIMS):
-            return ImgInfo(path=path, size=st.st_size, mtime=st.st_mtime,
-                           bits=np.frombuffer(hit.bits, dtype=np.uint64),
-                           features=dequantise(hit.features))
+                and len(hit.features) == FEATURE_BYTES):
+            infos.append(ImgInfo(path=path, size=st.st_size, mtime=st.st_mtime,
+                                 features=unpack_features(hit.features)))
+        else:
+            todo.append(path)
 
-        bits, features = fingerprint(path)
-        if cache is not None:
-            entry = CachedFeatures(
-                key=os.path.normcase(os.path.abspath(path)), size=st.st_size,
-                mtime_ns=st.st_mtime_ns, bits=bits.tobytes(),
-                features=quantise(features))
-            with fresh_lock:
-                fresh[entry.key] = entry
-        return ImgInfo(path=path, size=st.st_size, mtime=st.st_mtime,
-                       bits=bits, features=features)
+    done = len(infos)
+    if progress is not None and done:
+        progress(done, total)
 
-    infos: list[ImgInfo] = []
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers or _default_workers()) as pool:
-        futures = {pool.submit(work, p): p for p in todo}
-        try:
-            for future in futures:
+    if todo:
+        model = embedder or shared()
+        fresh: list[CachedFeatures] = []
+        batches = [todo[i:i + BATCH_SIZE]
+                   for i in range(0, len(todo), BATCH_SIZE)]
+
+        with ThreadPoolExecutor(
+                max_workers=workers or _default_workers()) as pool:
+            def submit(index: int) -> list:
+                if index >= len(batches):
+                    return []
+                return [pool.submit(load_for_embedding, p)
+                        for p in batches[index]]
+
+            pending = submit(0)
+            for index, batch in enumerate(batches):
                 if cancel is not None and cancel.is_set():
+                    for future in pending:
+                        future.cancel()
                     break
-                path = futures[future]
-                try:
-                    infos.append(future.result())
-                except Exception as exc:       # unreadable / unsupported file
-                    errors.append((path, str(exc)))
-                done += 1
+                # Start decoding the next batch before blocking on this one's
+                # forward pass, so the two overlap.
+                ahead = submit(index + 1)
+
+                ready: list[np.ndarray] = []
+                kept: list[str] = []
+                for path, future in zip(batch, pending, strict=True):
+                    try:
+                        ready.append(future.result())
+                        kept.append(path)
+                    except Exception as exc:   # unreadable / unsupported file
+                        errors.append((path, str(exc)))
+                pending = ahead
+
+                if ready:
+                    try:
+                        vectors = model.embed(np.stack(ready))
+                    except Exception as exc:
+                        errors += [(p, str(exc)) for p in kept]
+                        vectors = np.empty((0, EMBED_DIM), dtype=np.float32)
+                    for path, vector in zip(kept, vectors, strict=False):
+                        st = stats[path]
+                        infos.append(ImgInfo(path=path, size=st.st_size,
+                                             mtime=st.st_mtime,
+                                             features=vector))
+                        fresh.append(CachedFeatures(
+                            key=os.path.normcase(os.path.abspath(path)),
+                            size=st.st_size, mtime_ns=st.st_mtime_ns,
+                            features=pack_features(vector)))
+
+                done += len(batch)
                 if progress is not None:
-                    progress(done, total)
-        finally:
-            if cancel is not None and cancel.is_set():
-                for future in futures:
-                    future.cancel()
+                    progress(min(done, total), total)
 
-    if cache is not None and fresh:
-        with contextlib.suppress(Exception):
-            cache.store(fresh.values())
+        if cache is not None and fresh:
+            with contextlib.suppress(Exception):
+                cache.store(fresh)
 
-    # Futures complete out of order; sort so results are reproducible.
+    # Batches complete out of order relative to the input; sort so results are
+    # reproducible.
     infos.sort(key=lambda i: i.path)
     errors.sort()
     return infos, errors
@@ -472,64 +365,55 @@ def scan_images(
 #  Distances
 # --------------------------------------------------------------------------- #
 
-_BYTE_POPCOUNT = np.array([bin(i).count("1") for i in range(256)],
-                          dtype=np.uint8)
-
-
-def _popcount(x: np.ndarray) -> np.ndarray:
-    """Per-element set-bit count for a uint64 array."""
-    counter = getattr(np, "bitwise_count", None)
-    if counter is not None:                       # numpy >= 2.0
-        return counter(x)
-    return _BYTE_POPCOUNT[
-        x.view(np.uint8).reshape(x.shape + (8,))].sum(axis=-1)
-
-
-def scaled_features(infos: Sequence[ImgInfo]) -> np.ndarray:
-    """
-    Stack the continuous blocks, pre-scaled so plain squared Euclidean
-    distance between two rows equals their weighted continuous distance::
-
-        ||F_a - F_b||^2 == Wl*dl^2 + Wd*dd^2 + Wp*dp^2
-
-    Each block's own distance is a root-mean-square over its dimensions (a
-    Hellinger distance for the palette), which is why the scale factor carries
-    the block size.
-    """
-    matrix = np.empty((len(infos), FEATURE_DIMS), dtype=np.float32)
+def stack_features(infos: Sequence[ImgInfo]) -> np.ndarray:
+    """``(n, EMBED_DIM)`` matrix of unit-length embeddings."""
+    if not infos:
+        return np.empty((0, EMBED_DIM), dtype=np.float32)
+    matrix = np.empty((len(infos), EMBED_DIM), dtype=np.float32)
     for row, info in enumerate(infos):
         matrix[row] = info.features
-    scale = np.empty(FEATURE_DIMS, dtype=np.float32)
-    layout_end = LAYOUT_DIMS
-    detail_end = layout_end + DETAIL_DIMS
-    scale[:layout_end] = np.sqrt(W_LAYOUT / LAYOUT_DIMS)
-    scale[layout_end:detail_end] = np.sqrt(W_DETAIL / DETAIL_DIMS)
-    scale[detail_end:] = np.sqrt(W_PALETTE / 2.0)
-    return matrix * scale
+    return matrix
 
 
-def _struct_distance_sq(bits: np.ndarray, left: np.ndarray,
-                        right: np.ndarray) -> np.ndarray:
-    """``Ws * ds^2`` for the given index pairs."""
-    # Explicit accumulator: popcount yields uint8, and 5 words can total 320.
-    hamming = _popcount(bits[left] ^ bits[right]).sum(axis=1, dtype=np.int64)
-    return W_STRUCT * hamming.astype(np.float64) / STRUCT_BITS
+def distance_from_cosine(cosine: np.ndarray | float) -> np.ndarray:
+    """Cosine similarity -> distance in ``[0, 1]``."""
+    similar = (np.asarray(cosine, dtype=np.float64) - COSINE_FLOOR) \
+        / (1.0 - COSINE_FLOOR)
+    return 1.0 - np.clip(similar, 0.0, 1.0)
 
 
-def pair_distances(features: np.ndarray, bits: np.ndarray, left: np.ndarray,
+def squared_limit(radius: float) -> float:
+    """
+    Squared *Euclidean* distance matching a ``radius`` in distance units.
+
+    The embeddings are unit length, so ``||a - b||^2 == 2 - 2 cos``.  That
+    makes the cheap BLAS search below exact rather than approximate: it is the
+    same ordering, just expressed in the metric one matrix product produces.
+
+    A radius of 1 is special.  Every cosine at or below ``COSINE_FLOOR`` clips
+    to distance exactly 1.0, so "within 1.0" means *every* pair, including
+    opposite vectors - not merely those down to the floor.  Returning the
+    algebraic limit there would silently drop the pairs the caller most
+    explicitly asked for.
+    """
+    if radius >= 1.0:
+        return float("inf")
+    minimum_cosine = COSINE_FLOOR + (1.0 - radius) * (1.0 - COSINE_FLOOR)
+    return max(0.0, 2.0 - 2.0 * minimum_cosine)
+
+
+def pair_distances(features: np.ndarray, left: np.ndarray,
                    right: np.ndarray) -> np.ndarray:
-    """Full distance for each ``(left[i], right[i])`` pair."""
-    diff = features[left] - features[right]
-    total = np.einsum("ij,ij->i", diff, diff).astype(np.float64)
-    total += _struct_distance_sq(bits, left, right)
-    return np.sqrt(np.maximum(total, 0.0))
+    """Distance for each ``(left[i], right[i])`` pair."""
+    if left.size == 0:
+        return np.empty(0, dtype=np.float64)
+    cosine = np.einsum("ij,ij->i", features[left], features[right])
+    return distance_from_cosine(cosine)
 
 
 def distance(a: ImgInfo, b: ImgInfo) -> float:
     """Distance between two images, in ``[0, 1]``.  Convenience for tests."""
-    features = scaled_features([a, b])
-    bits = np.stack([a.bits, b.bits])
-    return float(pair_distances(features, bits,
+    return float(pair_distances(stack_features([a, b]),
                                 np.array([0]), np.array([1]))[0])
 
 
@@ -542,7 +426,7 @@ def similarity(a: ImgInfo, b: ImgInfo) -> float:
 #  Near-pair search
 # --------------------------------------------------------------------------- #
 
-def _all_pairs_within(features: np.ndarray, bits: np.ndarray, radius: float,
+def _all_pairs_within(features: np.ndarray, radius: float,
                       cancel: threading.Event | None = None,
                       progress: ProgressFn | None = None,
                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -555,13 +439,13 @@ def _all_pairs_within(features: np.ndarray, bits: np.ndarray, radius: float,
 
     Expanding ``||a - b||^2`` as ``||a||^2 + ||b||^2 - 2 a.b`` is what lets a
     single ``@`` do the work; it can go slightly negative for near-identical
-    rows through cancellation, which is why the caller takes a clamped square
-    root.  ``test_expansion_matches_direct_distances`` pins that equivalence.
+    rows through cancellation, which is why the caller clamps.
+    ``test_expansion_matches_direct_distances`` pins that equivalence.
     """
     n = features.shape[0]
     squared = np.einsum("ij,ij->i", features, features)
     chunk = max(1, min(n, 4_000_000 // max(1, n)))
-    limit = radius * radius
+    limit = squared_limit(radius)
 
     lefts: list[np.ndarray] = []
     rights: list[np.ndarray] = []
@@ -597,21 +481,20 @@ def _all_pairs_within(features: np.ndarray, bits: np.ndarray, radius: float,
         return empty, empty, np.empty(0, dtype=np.float64)
     left = np.concatenate(lefts)
     right = np.concatenate(rights)
-    return _confirm(features, bits, left, right, radius)
+    return _confirm(features, left, right, radius)
 
 
-def _confirm(features: np.ndarray, bits: np.ndarray, left: np.ndarray,
-             right: np.ndarray, radius: float
-             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _confirm(features: np.ndarray, left: np.ndarray, right: np.ndarray,
+             radius: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute exact distances for candidate pairs and drop the misses."""
     if left.size == 0:
         return left, right, np.empty(0, dtype=np.float64)
-    dist = pair_distances(features, bits, left, right)
+    dist = pair_distances(features, left, right)
     keep = dist <= radius
     return left[keep], right[keep], dist[keep]
 
 
-def near_pairs(features: np.ndarray, bits: np.ndarray, radius: float,
+def near_pairs(features: np.ndarray, radius: float,
                cancel: threading.Event | None = None,
                progress: ProgressFn | None = None,
                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -636,7 +519,7 @@ def near_pairs(features: np.ndarray, bits: np.ndarray, radius: float,
     if n < 2 or radius <= 0:
         empty = np.empty(0, dtype=np.int64)
         return empty, empty, np.empty(0, dtype=np.float64)
-    return _all_pairs_within(features, bits, radius, cancel, progress)
+    return _all_pairs_within(features, radius, cancel, progress)
 
 
 # --------------------------------------------------------------------------- #
@@ -667,8 +550,7 @@ def group_images(
     # tighter without changing which single pairs qualify.
     radius = min(1.0, cutoff * 1.5 + 0.02)
 
-    features = scaled_features(infos)
-    bits = np.stack([info.bits for info in infos]) if n else np.empty((0, 0))
+    features = stack_features(infos)
 
     # Both stages report 0..100 of their own, so scale them into one bar that
     # only ever moves forwards: searching is the slow part, merging the tail.
@@ -678,8 +560,7 @@ def group_images(
         return lambda done, total: progress(
             start + int(width * done / max(1, total)), 100)
 
-    left, right, dist = near_pairs(features, bits, radius, cancel,
-                                   staged(0, 70))
+    left, right, dist = near_pairs(features, radius, cancel, staged(0, 70))
     if cancel is not None and cancel.is_set():
         return []
 
@@ -688,7 +569,7 @@ def group_images(
     if cancel is not None and cancel.is_set():
         return []
 
-    return _finalise(infos, features, bits, clusters, ungrouped)
+    return _finalise(infos, features, clusters, ungrouped)
 
 
 def _agglomerate(n: int, left: np.ndarray, right: np.ndarray,
@@ -772,15 +653,20 @@ def _agglomerate(n: int, left: np.ndarray, right: np.ndarray,
 
 
 def _finalise(infos: Sequence[ImgInfo], features: np.ndarray,
-              bits: np.ndarray, clusters: list[list[int]],
+              clusters: list[list[int]],
               ungrouped: str) -> list[list[ImgInfo]]:
     """Order the clusters and images inside them, then number everything."""
     real = [c for c in clusters if len(c) > 1]
     singles = [c[0] for c in clusters if len(c) == 1]
 
-    ordered: list[list[int]] = []
+    ordered: list[tuple[list[int], float]] = []
     for cluster in real:
-        block = features[cluster]
+        # float64 on purpose.  In a two-image cluster both members are exactly
+        # equidistant from the centre *mathematically*, and in float32 the two
+        # spreads differ by about an ulp - enough to survive the rounding below
+        # and let float noise, rather than the images, decide which file
+        # becomes "<n>_1".
+        block = features[cluster].astype(np.float64)
         centre = block.mean(axis=0)
         offset = block - centre
         spread = np.einsum("ij,ij->i", offset, offset)
@@ -795,7 +681,7 @@ def _finalise(infos: Sequence[ImgInfo], features: np.ndarray,
             key=lambda item: (round(item[0], 9), item[1]))[2]
         rest = [i for i in cluster if i != exemplar]
         distances = pair_distances(
-            features, bits, np.full(len(rest), exemplar, dtype=np.int64),
+            features, np.full(len(rest), exemplar, dtype=np.int64),
             np.array(rest, dtype=np.int64)) if rest else np.empty(0)
         paired = sorted(zip(rest, distances.tolist(), strict=True),
                         key=lambda item: (item[1], infos[item[0]].path))
@@ -820,8 +706,7 @@ def _finalise(infos: Sequence[ImgInfo], features: np.ndarray,
         rest = np.array(cluster[1:], dtype=np.int64)
         if rest.size:
             distances = pair_distances(
-                features, bits, np.full(rest.size, exemplar, dtype=np.int64),
-                rest)
+                features, np.full(rest.size, exemplar, dtype=np.int64), rest)
         else:
             distances = np.empty(0)
         for position, info in enumerate(members):

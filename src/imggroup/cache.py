@@ -28,12 +28,16 @@ DB_NAME = "features.sqlite3"
 MAX_AGE_DAYS = 120
 MAX_ROWS = 400_000
 
+# Bump whenever the stored vector changes meaning.  Rows written by an older
+# descriptor are not merely stale - they describe images in a representation
+# that no longer exists - so they are dropped rather than migrated.
+SCHEMA_VERSION = 2
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS features (
     key       TEXT PRIMARY KEY,
     size      INTEGER NOT NULL,
     mtime_ns  INTEGER NOT NULL,
-    bits      BLOB NOT NULL,
     features  BLOB NOT NULL,
     used_at   INTEGER NOT NULL
 );
@@ -65,7 +69,12 @@ class FeatureCache:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with self._session() as db:
+                version = int(
+                    db.execute("PRAGMA user_version").fetchone()[0])
+                if version != SCHEMA_VERSION:
+                    db.executescript("DROP TABLE IF EXISTS features")
                 db.executescript(_SCHEMA)
+                db.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
             self.available = True
         except Exception:
             pass                     # run without a cache rather than fail
@@ -102,12 +111,12 @@ class FeatureCache:
                     batch = keys[start:start + 500]
                     placeholders = ",".join("?" * len(batch))
                     rows = db.execute(
-                        "SELECT key, size, mtime_ns, bits, features"
+                        "SELECT key, size, mtime_ns, features"
                         f" FROM features WHERE key IN ({placeholders})", batch)
                     for row in rows:
                         found[row[0]] = CachedFeatures(
                             key=row[0], size=row[1], mtime_ns=row[2],
-                            bits=bytes(row[3]), features=bytes(row[4]))
+                            features=bytes(row[3]))
         except Exception:
             return {}
         return found
@@ -124,18 +133,18 @@ class FeatureCache:
 
     # ---- writes ----------------------------------------------------------- #
     def store(self, entries: Iterable[CachedFeatures]) -> None:
-        rows = [(e.key, e.size, e.mtime_ns, e.bits, e.features,
+        rows = [(e.key, e.size, e.mtime_ns, e.features,
                  int(time.time())) for e in entries]
         if not rows or not self.available:
             return
         try:
             with self._session() as db:
                 db.executemany(
-                    "INSERT INTO features (key, size, mtime_ns, bits,"
-                    " features, used_at) VALUES (?,?,?,?,?,?)"
+                    "INSERT INTO features (key, size, mtime_ns,"
+                    " features, used_at) VALUES (?,?,?,?,?)"
                     " ON CONFLICT(key) DO UPDATE SET"
                     "   size=excluded.size, mtime_ns=excluded.mtime_ns,"
-                    "   bits=excluded.bits, features=excluded.features,"
+                    "   features=excluded.features,"
                     "   used_at=excluded.used_at", rows)
         except Exception:
             pass

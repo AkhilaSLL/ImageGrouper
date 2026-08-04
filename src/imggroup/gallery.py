@@ -26,10 +26,12 @@ from .theme import (
 
 THUMB_MIN = 150             # never shrink a thumbnail below this
 THUMB_MAX = 560             # width cap so a lone landscape image isn't huge
+THUMB_WRAP = 190            # cell size once a group wraps into a contact sheet
 SOURCE_CACHE_MAX = 1100     # decoded size kept in memory for fast rescaling
 CAPTION_SPACE = 132         # vertical room reserved for the captions
 CACHE_BUDGET = 192 << 20    # ~192 MB of decoded previews
 RESIZE_DEBOUNCE_MS = 130
+FILL_CHUNK = 4              # thumbnails decoded per idle tick
 
 
 class _SourceCache:
@@ -57,6 +59,10 @@ class _SourceCache:
             return cached
 
         with Image.open(path) as raw:
+            # Let libjpeg decode at 1/2, 1/4 or 1/8 scale rather than unpacking
+            # 24 MP and throwing most of it away.  It has to come before
+            # convert(), which would force the full-resolution decode first.
+            raw.draft("RGB", (SOURCE_CACHE_MAX, SOURCE_CACHE_MAX))
             oriented = ImageOps.exif_transpose(raw)
             image = (oriented or raw).convert("RGB")
             image.thumbnail((SOURCE_CACHE_MAX, SOURCE_CACHE_MAX),
@@ -86,6 +92,10 @@ class Gallery(ttk.LabelFrame):
         self._group: Sequence[ImgInfo] | None = None
         self._photos: list[ImageTk.PhotoImage] = []
         self._resize_job: str | None = None
+        self._fill_job: str | None = None
+        self._pending: list[tuple[ImgInfo, tk.Frame]] = []
+        self._generation = 0
+        self._fitting = False
         self._last_size = (0, 0)
         self._weighted: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
 
@@ -169,35 +179,67 @@ class Gallery(ttk.LabelFrame):
         Stretch the canvas window to at least the viewport size so the inner
         frame's spacer rows/columns can centre the content, and keep the
         scrollregion in sync with whichever is larger.
-        """
-        width = max(self.canvas.winfo_width(), self.inner.winfo_reqwidth())
-        height = max(self.canvas.winfo_height(), self.inner.winfo_reqheight())
-        self.canvas.itemconfigure(self._window, width=width, height=height)
-        self.canvas.configure(scrollregion=(0, 0, width, height))
 
-    def _thumb_box(self, count: int) -> tuple[int, int]:
+        The ``update_idletasks`` is not optional.  This runs immediately after
+        ``_render`` grids the cells, before Tk has recomputed the frame's
+        requested size - it used to measure 265px for a group 2656px wide.
+        Pinning the canvas window to that stale width then stopped the frame's
+        *actual* size from ever changing again, so the ``<Configure>`` binding
+        meant to correct it never fired and most of a group was unreachable at
+        any scroll position.
         """
-        Thumbnails are as tall as the panel allows, and as wide as an equal
-        share of it - so a whole group stays visible side by side instead of
-        scrolling off the edge.  THUMB_MAX stops a lone landscape image from
-        ballooning; below THUMB_MIN the strip scrolls sideways rather than
-        shrinking everything to nothing.
+        if self._fitting:          # update_idletasks re-enters via <Configure>
+            return
+        self._fitting = True
+        try:
+            self.inner.update_idletasks()
+            width = max(self.canvas.winfo_width(), self.inner.winfo_reqwidth())
+            height = max(self.canvas.winfo_height(),
+                         self.inner.winfo_reqheight())
+            self.canvas.itemconfigure(self._window, width=width, height=height)
+            self.canvas.configure(scrollregion=(0, 0, width, height))
+        finally:
+            self._fitting = False
+
+    def _thumb_box(self, count: int) -> tuple[int, int, int]:
+        """
+        Return ``(box_w, box_h, columns)`` for a group of ``count`` images.
+
+        A group small enough to sit in one row gets the full height of the
+        panel and an equal share of its width, capped by THUMB_MAX so a lone
+        landscape image doesn't balloon.  Once that share would squeeze the
+        thumbnails below THUMB_MIN the group wraps into a contact sheet
+        instead: album-sized groups are the normal case, and a single row of
+        eighty images is a 15,000px strip that nobody can scan.
         """
         scale = self._scale
         canvas_w = self.canvas.winfo_width() or round(900 * scale)
         canvas_h = self.canvas.winfo_height() or round(540 * scale)
-        reserved = round(CAPTION_SPACE * scale)
-        box_h = int(max(THUMB_MIN * scale,
-                        min(SOURCE_CACHE_MAX, canvas_h - reserved)))
-        share = (canvas_w - 28 * scale) / max(1, count) - 18 * scale
-        box_w = int(min(THUMB_MAX * scale, max(THUMB_MIN * scale, share)))
-        return box_w, box_h
+        margin, gap = round(28 * scale), round(18 * scale)
+
+        share = (canvas_w - margin) / max(1, count) - gap
+        if share >= THUMB_MIN * scale:
+            reserved = round(CAPTION_SPACE * scale)
+            box_h = int(max(THUMB_MIN * scale,
+                            min(SOURCE_CACHE_MAX, canvas_h - reserved)))
+            return int(min(THUMB_MAX * scale, share)), box_h, count
+
+        box = int(THUMB_WRAP * scale)
+        return box, box, max(1, int((canvas_w - margin) // (box + gap)))
 
     # ---- content ---------------------------------------------------------- #
     def _reset(self) -> None:
         if self._resize_job is not None:
             self.after_cancel(self._resize_job)
             self._resize_job = None
+        # Retire any half-finished fill before the slots it holds are
+        # destroyed; the generation bump makes an already-queued tick a no-op
+        # even if the cancel lost a race with it.
+        if self._fill_job is not None:
+            self.after_cancel(self._fill_job)
+            self._fill_job = None
+        self._generation += 1
+        self._pending = []
         for child in self.inner.winfo_children():
             child.destroy()
         self._photos.clear()
@@ -233,36 +275,67 @@ class Gallery(ttk.LabelFrame):
         self._cache.clear()
 
     def _render(self) -> None:
+        """
+        Lay the group out immediately, then fill the pictures in progressively.
+
+        Decoding every image up front is what a three-image "group" could
+        afford; an album of fifty cannot.  Measured on real files, decoding the
+        lot synchronously blocked the UI thread for 2.3s at sixty small images
+        and would comfortably clear the five seconds at which Windows paints
+        "Not Responding" over the window for an album of full-size
+        photographs.  So the cells - which are cheap - go down at once, and the
+        thumbnails arrive a few per idle tick.
+
+        Every slot is a fixed box, so pictures appearing later never move
+        anything that is already on screen, and captions line up by
+        construction rather than by measuring the tallest image first.
+        """
         self._resize_job = None
         group = self._group
         if not group:
             return
         self._reset()
 
-        box_w, box_h = self._thumb_box(len(group))
+        box_w, box_h, columns = self._thumb_box(len(group))
         scale = self._scale
         pad = round(8 * scale)
-
-        # Decode everything first: the tallest thumbnail sets a common slot
-        # height, so captions line up across the row instead of stair-stepping
-        # under images of different aspect ratios.
-        rendered = [self._thumbnail(info, box_w, box_h) for info in group]
-        slot_h = max((p.height() for p in rendered if p is not None),
-                     default=round(THUMB_MIN * scale))
+        rows = (len(group) + columns - 1) // columns
 
         # Spacer rows/columns keep a small group centred in a large panel.
-        self._set_spacers((0, 2), (0, len(group) + 1))
+        self._set_spacers((0, rows + 1), (0, columns + 1))
 
-        for column, (info, photo) in enumerate(zip(group, rendered,
-                                                   strict=True), start=1):
+        self._pending = []
+        for position, info in enumerate(group):
+            row, column = divmod(position, columns)
             cell = tk.Frame(self.inner, bg=WINDOW)
-            cell.grid(row=1, column=column, sticky="n",
+            cell.grid(row=row + 1, column=column + 1, sticky="n",
                       padx=pad, pady=round(10 * scale))
-            self._build_cell(cell, info, photo, box_w, slot_h)
+            self._pending.append((info, self._build_cell(cell, info, box_w,
+                                                         box_h)))
 
         self._fit_window()
         self.canvas.xview_moveto(0.0)
         self.canvas.yview_moveto(0.0)
+
+        self._generation += 1
+        self._fill(0, self._generation, box_w, box_h)
+
+    def _fill(self, start: int, generation: int, box_w: int,
+              box_h: int) -> None:
+        """Decode and install the next few thumbnails, then yield to Tk."""
+        self._fill_job = None
+        if generation != self._generation:
+            return                      # a different group was selected
+
+        for info, slot in self._pending[start:start + FILL_CHUNK]:
+            if not slot.winfo_exists():
+                return
+            self._install(slot, info, box_w, box_h)
+
+        following = start + FILL_CHUNK
+        if following < len(self._pending):
+            self._fill_job = self.after(1, self._fill, following, generation,
+                                        box_w, box_h)
 
     def _thumbnail(self, info: ImgInfo, box_w: int,
                    box_h: int) -> ImageTk.PhotoImage | None:
@@ -276,30 +349,14 @@ class Gallery(ttk.LabelFrame):
         self._photos.append(photo)
         return photo
 
-    def _build_cell(self, cell: tk.Frame, info: ImgInfo,
-                    photo: ImageTk.PhotoImage | None,
-                    box_w: int, slot_h: int) -> None:
+    def _build_cell(self, cell: tk.Frame, info: ImgInfo, box_w: int,
+                    box_h: int) -> tk.Frame:
+        """Everything except the picture; returns the slot to fill later."""
         scale = self._scale
         exemplar = info.index == 1
-        slot = tk.Frame(cell, bg=WINDOW, width=box_w, height=slot_h + 2)
+        slot = tk.Frame(cell, bg=WINDOW, width=box_w, height=box_h + 2)
         slot.pack_propagate(False)
         slot.pack()
-        if photo is not None:
-            # The exemplar gets a lit border: it is the image the group was
-            # measured against, and the one that becomes "<group>_1".
-            holder = tk.Frame(slot, bg=EXEMPLAR_FG if exemplar else BORDER,
-                              padx=1, pady=1)
-            holder.place(relx=0.5, rely=0.5, anchor="center")
-            label = tk.Label(holder, image=photo, bg=WINDOW, bd=0,
-                             cursor="hand2")
-            label.pack()
-            opener = self._on_open
-            if opener is not None:
-                label.bind("<Double-1>", lambda _e, p=info.path: opener(p))
-        else:
-            tk.Label(slot, text="[cannot preview]", fg=FG_MUTED, bg=WINDOW,
-                     wraplength=box_w, justify="center").place(
-                relx=0.5, rely=0.5, anchor="center")
 
         tk.Label(cell, text=info.new_name, bg=WINDOW,
                  fg=EXEMPLAR_FG if exemplar else FG,
@@ -312,3 +369,23 @@ class Gallery(ttk.LabelFrame):
                       else f"{info.match:.1f}% like the exemplar",
                  bg=WINDOW, fg=EXEMPLAR_FG if exemplar else ACCENT,
                  font=(FONT_BOLD, 9)).pack(pady=(2, round(6 * scale)))
+        return slot
+
+    def _install(self, slot: tk.Frame, info: ImgInfo, box_w: int,
+                 box_h: int) -> None:
+        photo = self._thumbnail(info, box_w, box_h)
+        if photo is None:
+            tk.Label(slot, text="[cannot preview]", fg=FG_MUTED, bg=WINDOW,
+                     wraplength=box_w, justify="center").place(
+                relx=0.5, rely=0.5, anchor="center")
+            return
+        # The exemplar gets a lit border: it is the image the group was
+        # measured against, and the one that becomes "<group>_1".
+        holder = tk.Frame(slot, bg=EXEMPLAR_FG if info.index == 1 else BORDER,
+                          padx=1, pady=1)
+        holder.place(relx=0.5, rely=0.5, anchor="center")
+        label = tk.Label(holder, image=photo, bg=WINDOW, bd=0, cursor="hand2")
+        label.pack()
+        opener = self._on_open
+        if opener is not None:
+            label.bind("<Double-1>", lambda _e, p=info.path: opener(p))

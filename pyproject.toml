@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "imggroup"
-version = "1.0.0"
-description = "Group visually similar images and reorganise them into one folder."
+version = "2.0.0"
+description = "Group images into albums by what is in them, and reorganise them into one folder."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "AkhilaSLL" }]
-keywords = ["images", "clustering", "perceptual-hash", "cielab", "tkinter"]
+keywords = ["images", "clustering", "embeddings", "dinov2", "onnx", "tkinter"]
 classifiers = [
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "Pillow>=10.0",
     "numpy>=1.24",
+    "onnxruntime>=1.17",
 ]
 
 [project.optional-dependencies]
