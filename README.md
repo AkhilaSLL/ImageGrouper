@@ -120,6 +120,12 @@ progressively — an album of fifty photographs would otherwise lock the window
 up while it decoded them all. **Double-click** a row or a thumbnail to open the
 image; **right-click** for Open, Show in Explorer and Copy full path.
 
+Each thumbnail is captioned with its new name, its current file name **and the
+folder it came from**. An album routinely spans every folder you scanned, so the
+folder is what says where a picture actually came from. Very long paths are
+shortened from the middle, keeping the drive and the deepest folders — the parts
+that actually differ.
+
 ### 4. Copy
 
 **Copy N files → destination** writes every grouped image into the destination

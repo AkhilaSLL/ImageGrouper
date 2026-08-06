@@ -15,7 +15,7 @@ resize or a re-encode.
 Nothing is ever moved or deleted - sources are only read.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = ["__version__", "main", "selftest"]
 

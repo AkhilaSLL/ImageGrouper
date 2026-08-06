@@ -228,6 +228,13 @@ cannot `VACUUM` inside one, and doing so rolls the `DELETE` back.
 - The destination is validated against the source folders with `is_inside()` in
   both directions: writing copies into a scanned folder would feed this run's
   output into the next analysis.
+- The caption carries the file's **containing folder** under its current name
+  (`folder_caption`/`elide_middle`). A group here is an album, and an album
+  routinely spans every source folder that was scanned, so the folder is what
+  says where a picture actually came from. The character budget scales with
+  cell width — that matters more here than in the sibling projects, because a
+  wrapped contact sheet gives each cell only `THUMB_WRAP` of width to play
+  with. `CAPTION_SPACE` was raised to reserve the room.
 - `shellops.py` has **no delete path at all**, unlike the sibling projects.
   This app only reads sources and writes copies, so it needs no Recycle Bin
   handling and should not grow any.
@@ -257,6 +264,7 @@ the `upx_exclude` entries; don't remove them.
 | `renderperf.py` | worst UI-thread block while the preview renders |
 | `drive_v2.py` | drives the real app in process, end to end |
 | `shot_app.py` | brings the app up grouped, for a PrintWindow capture |
+| `shot_paths.py` | same, but across two space-containing source folders, for the preview's folder line and the Explorer reveal |
 | `scale.py` | search timing on a large synthetic dump |
 
 **A GUI probe must never pump Tk by hand around a blocking call.** An earlier

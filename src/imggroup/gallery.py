@@ -28,10 +28,43 @@ THUMB_MIN = 150             # never shrink a thumbnail below this
 THUMB_MAX = 560             # width cap so a lone landscape image isn't huge
 THUMB_WRAP = 190            # cell size once a group wraps into a contact sheet
 SOURCE_CACHE_MAX = 1100     # decoded size kept in memory for fast rescaling
-CAPTION_SPACE = 132         # vertical room reserved for the captions
+CAPTION_SPACE = 164         # vertical room reserved for the captions
 CACHE_BUDGET = 192 << 20    # ~192 MB of decoded previews
 RESIZE_DEBOUNCE_MS = 130
 FILL_CHUNK = 4              # thumbnails decoded per idle tick
+FOLDER_CHARS_MAX = 120      # never show more of a folder path than this
+FOLDER_CHARS_MIN = 44       # ...nor less, however narrow the cell gets
+
+
+def elide_middle(text: str, limit: int) -> str:
+    """
+    Shorten ``text`` to ``limit`` characters by dropping from the middle.
+
+    The middle is the right thing to drop for a path: the head carries the
+    drive and top-level folder, the tail carries the deepest folders, and
+    between them those are what tell two source folders apart.  Trimming from
+    either end alone throws away one half of that.
+    """
+    if len(text) <= limit:
+        return text
+    keep = limit - 1                        # one character goes to the ellipsis
+    head = keep // 2
+    return f"{text[:head]}…{text[len(text) - (keep - head):]}"
+
+
+def folder_caption(path: str, box_w: int) -> str:
+    """
+    The folder ``path`` sits in, trimmed to roughly two lines at ``box_w``.
+
+    Ordinary paths fit whole; the budget only exists so one deeply nested path
+    can't wrap into five lines and stretch its cell taller than its neighbours
+    - which matters more here than in the sibling projects, because a wrapped
+    contact sheet gives every cell only THUMB_WRAP of width to play with.  At
+    the 9pt caption font a character averages a little under 5px, so
+    ``box_w // 3`` is a conservative two lines' worth.
+    """
+    budget = min(FOLDER_CHARS_MAX, max(FOLDER_CHARS_MIN, box_w // 3))
+    return elide_middle(os.path.dirname(path), budget)
 
 
 class _SourceCache:
@@ -364,6 +397,12 @@ class Gallery(ttk.LabelFrame):
         tk.Label(cell, text=os.path.basename(info.path), bg=WINDOW,
                  fg=FG_MUTED, font=(FONT, 9),
                  wraplength=max(box_w, 160), justify="center").pack()
+        # Which folder the file came from.  A group here is an album, and an
+        # album routinely spans every source folder that was scanned, so the
+        # folder is what says where a picture actually came from.
+        tk.Label(cell, text=folder_caption(info.path, box_w), bg=WINDOW,
+                 fg=FG_MUTED, font=(FONT, 8),
+                 wraplength=max(box_w, 160), justify="center").pack(pady=(0, 1))
         tk.Label(cell,
                  text="group exemplar" if exemplar
                       else f"{info.match:.1f}% like the exemplar",
