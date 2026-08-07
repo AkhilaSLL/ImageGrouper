@@ -82,9 +82,10 @@ The result is a single standalone file: `dist\ImageGrouper.exe`.
 
 ### 1. Choose the folders to read
 
-Add **as many source folders as you like** with **Add folder…**. Images are
-grouped within each folder *and* across all of them. Select entries and press
-**Remove** (or <kbd>Delete</kbd>) to drop them.
+**Drag folders straight in from Explorer**, or use **Add folder…**. Add as
+many source folders as you like; images are grouped within each folder *and*
+across all of them. Dropping a *file* adds the folder containing it. Select
+entries and press **Remove** (or <kbd>Delete</kbd>) to drop them.
 
 - **Include subfolders** toggles recursive scanning.
 - **Reuse cached features** skips re-reading files that haven't changed since
@@ -92,7 +93,8 @@ grouped within each folder *and* across all of them. Select entries and press
 
 ### 2. Choose where the organised copies go
 
-Set a **destination** folder. It must sit *outside* every source folder — the
+Set a **destination** folder — type it, press **Browse…**, or drag a folder
+onto the destination panel. It must sit *outside* every source folder — the
 app refuses otherwise, because writing the copies into a folder it scans would
 mean the next analysis picks its own output back up.
 
@@ -267,6 +269,8 @@ Untick **Reuse cached features** to force a full re-read, or press
 │   ├── settings.py                 settings persisted between launches
 │   ├── shellops.py                 open / reveal in Explorer
 │   ├── app.py                      main window and controller
+│   ├── dnd.py                      folders dragged in from Explorer
+│   ├── folderpanel.py              folder list, drop zone, empty state
 │   ├── gallery.py                  contact-sheet preview panel
 │   ├── theme.py                    dark ttk theme
 │   └── resources.py                assets, DPI, dark title bar, taskbar id

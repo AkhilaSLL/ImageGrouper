@@ -13,7 +13,7 @@ from PIL import Image, ImageOps, ImageTk
 
 from .engine import ImgInfo
 from .theme import (
-    ACCENT,
+    ACCENT_TEXT,
     BORDER,
     EXEMPLAR_FG,
     FG,
@@ -21,6 +21,8 @@ from .theme import (
     FONT,
     FONT_BOLD,
     FONT_MONO,
+    GAP,
+    PAD_CARD,
     WINDOW,
 )
 
@@ -113,12 +115,12 @@ class _SourceCache:
         self._bytes = 0
 
 
-class Gallery(ttk.LabelFrame):
+class Gallery(ttk.Frame):
     """Scrollable, resizable strip of thumbnails for the selected group."""
 
     def __init__(self, master: tk.Misc, scale: float = 1.0,
                  on_open: Callable[[str], None] | None = None) -> None:
-        super().__init__(master, text="  PREVIEW  ")
+        super().__init__(master, style="Card.TFrame")
         self._scale = scale
         self._on_open = on_open
         self._cache = _SourceCache()
@@ -139,10 +141,19 @@ class Gallery(ttk.LabelFrame):
                             command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self.canvas.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.rowconfigure(0, weight=1)
+        header = ttk.Frame(self, style="TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew",
+                    padx=self._px(PAD_CARD),
+                    pady=(self._px(PAD_CARD), self._px(GAP)))
+        ttk.Label(header, text="PREVIEW", style="Legend.TLabel").pack(
+            side="left")
+        self.caption = ttk.Label(header, text="", style="Muted.TLabel")
+        self.caption.pack(side="right")
+
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        hsb.grid(row=2, column=0, sticky="ew")
+        self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
 
         self.inner = tk.Frame(self.canvas, bg=WINDOW)
@@ -153,9 +164,14 @@ class Gallery(ttk.LabelFrame):
         self.inner.bind("<Configure>", lambda _e: self._fit_window())
         self.canvas.bind("<Enter>", self._bind_wheel)
         self.canvas.bind("<Leave>", self._unbind_wheel)
+        self.bind("<Enter>", self._bind_wheel)
+        self.bind("<Leave>", self._unbind_wheel)
 
         self.show_message("Analyse a folder, then select a group to\n"
                           "see its images side by side.")
+
+    def _px(self, value: float) -> int:
+        return max(1, round(value * self._scale))
 
     # ---- scrolling -------------------------------------------------------- #
     def _bind_wheel(self, _event: tk.Event | None = None) -> None:
@@ -165,7 +181,33 @@ class Gallery(ttk.LabelFrame):
             self.canvas.bind_all("<Button-4>", self._on_wheel)
             self.canvas.bind_all("<Button-5>", self._on_wheel)
 
+    def _pointer_inside(self) -> bool:
+        """Is the mouse still somewhere within this gallery?"""
+        try:
+            widget = self.winfo_containing(self.winfo_pointerx(),
+                                           self.winfo_pointery())
+        except tk.TclError:
+            return False
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
     def _unbind_wheel(self, _event: tk.Event | None = None) -> None:
+        """
+        Let the wheel go, but only once the pointer has really left.
+
+        Every thumbnail is a real child widget inside the canvas, and Tk sends
+        a widget <Leave> when the pointer crosses into one of its children.
+        Unbinding on any <Leave> therefore disarmed the wheel the moment the
+        cursor touched a picture - which is nearly the whole panel - leaving it
+        working only over the few pixels of backdrop between cells.  Vertical
+        scrolling hid the symptom because the strip usually fits vertically;
+        sideways it just looked broken.
+        """
+        if self._pointer_inside():
+            return
         for sequence in ("<MouseWheel>", "<Shift-MouseWheel>",
                          "<Button-4>", "<Button-5>"):
             self.canvas.unbind_all(sequence)
@@ -294,6 +336,7 @@ class Gallery(ttk.LabelFrame):
 
     def show_message(self, text: str) -> None:
         self._group = None
+        self.caption.config(text="")
         self._reset()
         self._set_spacers((0, 2), (0, 2))
         tk.Label(self.inner, text=text, bg=WINDOW, fg=FG_MUTED,
@@ -302,6 +345,9 @@ class Gallery(ttk.LabelFrame):
 
     def show_group(self, group: Sequence[ImgInfo]) -> None:
         self._group = group
+        self.caption.config(
+            text=f"{len(group)} images"
+            if len(group) != 1 else "1 image")
         self._render()
 
     def clear_cache(self) -> None:
@@ -406,7 +452,7 @@ class Gallery(ttk.LabelFrame):
         tk.Label(cell,
                  text="group exemplar" if exemplar
                       else f"{info.match:.1f}% like the exemplar",
-                 bg=WINDOW, fg=EXEMPLAR_FG if exemplar else ACCENT,
+                 bg=WINDOW, fg=EXEMPLAR_FG if exemplar else ACCENT_TEXT,
                  font=(FONT_BOLD, 9)).pack(pady=(2, round(6 * scale)))
         return slot
 

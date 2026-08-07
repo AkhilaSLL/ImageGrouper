@@ -15,6 +15,7 @@ from typing import Any
 from PIL import Image, ImageTk
 
 from .cache import FeatureCache
+from .dnd import register_drop_target
 from .engine import (
     UNGROUPED_OPTIONS,
     ImgInfo,
@@ -26,6 +27,7 @@ from .engine import (
     organise,
     scan_images,
 )
+from .folderpanel import FolderPanel
 from .gallery import Gallery
 from .resources import (
     apply_dark_titlebar,
@@ -37,10 +39,17 @@ from .settings import MAX_THRESHOLD, MIN_THRESHOLD, Settings
 from .theme import (
     ACCENT,
     BORDER,
+    EDGE,
     ELEV,
     EXEMPLAR_FG,
     FG,
     FG_MUTED,
+    GAP,
+    GAP_SECTION,
+    GAP_TIGHT,
+    GAP_WIDE,
+    ON_FILL,
+    PAD_CARD,
     WINDOW,
     apply_theme,
 )
@@ -146,26 +155,27 @@ class App(tk.Tk):
             pass
 
     def _build_ui(self) -> None:
-        edge = self._px(18)
+        edge = self._px(EDGE)
 
         header = ttk.Frame(self, style="Window.TFrame")
-        header.pack(fill="x", padx=edge, pady=(self._px(14), self._px(6)))
+        header.pack(fill="x", padx=edge, pady=(self._px(GAP_WIDE),
+                                               self._px(GAP_WIDE)))
         try:
             with Image.open(asset_path("app.png")) as raw:
                 logo = raw.convert("RGBA").resize(
-                    (self._px(34), self._px(34)), Image.Resampling.LANCZOS)
+                    (self._px(30), self._px(30)), Image.Resampling.LANCZOS)
             self._logo_photo = ImageTk.PhotoImage(logo)
             tk.Label(header, image=self._logo_photo, bg=WINDOW,
-                     bd=0).pack(side="left")
+                     bd=0).pack(side="left", padx=(0, self._px(GAP_TIGHT)))
         except Exception:
             pass
-        ttk.Label(header, text="  Image Grouper",
+        ttk.Label(header, text="Image Grouper",
                   style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="groups images into albums by what is in them"
                               "  ·  copies them out renamed, never moves or "
                               "deletes",
-                  style="WindowMuted.TLabel").pack(side="left",
-                                                   padx=self._px(14))
+                  style="Tagline.TLabel").pack(side="left",
+                                               padx=(self._px(GAP_WIDE), 0))
 
         self._build_sources(edge)
         self._build_destination(edge)
@@ -174,117 +184,147 @@ class App(tk.Tk):
         self._build_status(edge)
         self._build_context_menu()
 
-    def _build_sources(self, edge: int) -> None:
-        top = ttk.LabelFrame(self, text="  SOURCE FOLDERS  ")
-        top.pack(fill="x", padx=edge, pady=self._px(6))
+    def _card(self, edge: int, bottom: int) -> ttk.Frame:
+        """A bordered panel on the window background, with its inner padding."""
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="x", padx=edge, pady=(0, self._px(bottom)))
+        body = ttk.Frame(card, style="TFrame")
+        body.pack(fill="both", expand=True, padx=self._px(PAD_CARD),
+                  pady=self._px(PAD_CARD))
+        return body
 
+    def _rule(self, parent: tk.Misc, pady: tuple[int, int]) -> None:
+        tk.Frame(parent, background=BORDER, height=1).pack(fill="x", pady=pady)
+
+    def _build_sources(self, edge: int) -> None:
         self.recursive = tk.BooleanVar(value=True)
         self.use_cache = tk.BooleanVar(value=True)
         self.threshold = tk.IntVar(value=self.settings.threshold)
 
-        listing = ttk.Frame(top)
-        listing.grid(row=0, column=0, sticky="nsew",
-                     padx=(self._px(8), self._px(4)), pady=self._px(8))
-        self.folder_list = tk.Listbox(
-            listing, height=3, selectmode="extended", activestyle="none",
-            bg=ELEV, fg=FG, bd=0, highlightthickness=1,
-            highlightbackground=BORDER, highlightcolor=ACCENT,
-            selectbackground=ACCENT, selectforeground="#ffffff",
-            exportselection=False, font=("Segoe UI", 10))
-        scroll = ttk.Scrollbar(listing, orient="vertical",
-                               command=self.folder_list.yview)
-        self.folder_list.configure(yscrollcommand=scroll.set)
-        self.folder_list.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-        listing.rowconfigure(0, weight=1)
-        listing.columnconfigure(0, weight=1)
-        self.folder_list.bind("<Double-1>", self._on_folder_double)
-        self.folder_list.bind("<Delete>", lambda _e: self._remove_folders())
+        body = self._card(edge, GAP_SECTION)
 
-        buttons = ttk.Frame(top)
-        buttons.grid(row=0, column=1, sticky="n",
-                     padx=(0, self._px(8)), pady=self._px(8))
-        ttk.Button(buttons, text="Add folder…", width=13,
-                   command=self._add_folder).pack(fill="x")
-        ttk.Button(buttons, text="Remove", width=13, style="Secondary.TButton",
-                   command=self._remove_folders).pack(fill="x",
-                                                      pady=(self._px(4), 0))
-        top.columnconfigure(0, weight=1)
+        legend = ttk.Frame(body, style="TFrame")
+        legend.pack(fill="x", pady=(0, self._px(GAP)))
+        ttk.Label(legend, text="SOURCE FOLDERS",
+                  style="Legend.TLabel").pack(side="left")
+        self.folder_count = ttk.Label(legend, text="", style="Muted.TLabel")
+        self.folder_count.pack(side="right")
 
-        options = ttk.Frame(top)
-        options.grid(row=1, column=0, columnspan=2, sticky="we",
-                     padx=self._px(8), pady=(0, self._px(8)))
+        self.folder_panel = FolderPanel(
+            body, self.scale_factor, on_open=self._open_path,
+            on_change=self._on_folders_changed,
+            dialog_title="Add a folder of images",
+            empty_hint="Drop folders of images here")
+        self.folder_panel.pack(fill="x")
+
+        self._rule(body, (self._px(PAD_CARD), self._px(GAP_WIDE)))
+
+        options = ttk.Frame(body, style="TFrame")
+        options.pack(fill="x")
+
+        # Analyse is the card's one primary action, so it is packed first and
+        # sits hard right; everything else on this row is a modifier.
+        self.scan_btn = ttk.Button(options, text="Analyse", width=11,
+                                   command=self._on_analyse_clicked)
+        self.scan_btn.pack(side="right")
+
+        threshold = ttk.Frame(options, style="TFrame")
+        threshold.pack(side="right", padx=(self._px(GAP_WIDE),
+                                           self._px(GAP_WIDE)))
+        ttk.Label(threshold, text="Similarity", style="Muted.TLabel").pack(
+            side="left", padx=(0, self._px(GAP)))
+        self.thr_scale = ttk.Scale(threshold, from_=MIN_THRESHOLD,
+                                   to=MAX_THRESHOLD, command=self._on_threshold,
+                                   length=self._px(190))
+        self.thr_scale.pack(side="left")
+        self.thr_label = ttk.Label(threshold, text="75%", width=5,
+                                   anchor="e", style="Value.TLabel")
+        self.thr_label.pack(side="left", padx=(self._px(GAP), 0))
+
         ttk.Checkbutton(options, text="Include subfolders",
                         variable=self.recursive).pack(
-            side="left", padx=(0, self._px(16)))
+            side="left", padx=(0, self._px(GAP_WIDE)))
         ttk.Checkbutton(options, text="Reuse cached features",
                         variable=self.use_cache).pack(side="left")
         # No fixed width: the label grows a digit at a time with the cache
         # count, and a fixed one clipped "Clear cache (12,345)".
         self.cache_btn = ttk.Button(options, text="Clear cache",
-                                    style="Secondary.TButton",
+                                    style="Ghost.TButton",
                                     command=self._clear_cache)
-        self.cache_btn.pack(side="left", padx=self._px(8))
+        self.cache_btn.pack(side="left", padx=(self._px(GAP_WIDE), 0))
 
-        self.scan_btn = ttk.Button(options, text="Analyse", width=10,
-                                   command=self._on_analyse_clicked)
-        self.scan_btn.pack(side="right")
-        self.thr_label = ttk.Label(options, text="75%", width=5,
-                                   style="Muted.TLabel")
-        self.thr_scale = ttk.Scale(options, from_=MIN_THRESHOLD,
-                                   to=MAX_THRESHOLD, command=self._on_threshold,
-                                   length=self._px(210))
-        ttk.Label(options, text="Similarity").pack(side="left",
-                                                   padx=(self._px(16), 0))
-        self.thr_scale.pack(side="left", padx=self._px(8))
-        self.thr_label.pack(side="left", padx=(0, self._px(10)))
         # Only now - Scale.set() fires the command, which needs thr_label.
         self.thr_scale.set(self.threshold.get())
         # Regroup on release rather than on every pixel of drag: the grouping
         # is fast but not free, and mid-drag results are never looked at.
         self.thr_scale.bind("<ButtonRelease-1>", self._schedule_regroup)
+        self._on_folders_changed()
 
     def _build_destination(self, edge: int) -> None:
-        box = ttk.LabelFrame(self, text="  DESTINATION  ")
-        box.pack(fill="x", padx=edge, pady=self._px(6))
-
         self.destination = tk.StringVar(value="")
         self.subfolders = tk.BooleanVar(value=False)
         self.ungrouped = tk.StringVar(value=UNGROUPED_OPTIONS[0])
 
-        row = ttk.Frame(box)
-        row.pack(fill="x", padx=self._px(8), pady=(self._px(8), self._px(2)))
+        body = self._card(edge, GAP_SECTION)
+
+        legend = ttk.Frame(body, style="TFrame")
+        legend.pack(fill="x", pady=(0, self._px(GAP)))
+        ttk.Label(legend, text="DESTINATION",
+                  style="Legend.TLabel").pack(side="left")
+        self.dest_hint = ttk.Label(legend, text="", style="Muted.TLabel")
+        self.dest_hint.pack(side="right")
+
+        row = ttk.Frame(body, style="TFrame")
+        row.pack(fill="x")
         ttk.Entry(row, textvariable=self.destination).pack(
             side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse…", width=11, style="Secondary.TButton",
-                   command=self._pick_destination).pack(side="left",
-                                                        padx=(self._px(8), 0))
+        ttk.Button(row, text="Browse…", width=12, style="Secondary.TButton",
+                   command=self._pick_destination).pack(
+            side="left", padx=(self._px(GAP), 0))
 
-        options = ttk.Frame(box)
-        options.pack(fill="x", padx=self._px(8), pady=(0, self._px(8)))
+        options = ttk.Frame(body, style="TFrame")
+        options.pack(fill="x", pady=(self._px(GAP_WIDE), 0))
         ttk.Checkbutton(options, text="A subfolder per group",
                         variable=self.subfolders).pack(side="left")
         ttk.Label(options, text="Images that match nothing:",
-                  style="Muted.TLabel").pack(side="left",
-                                             padx=(self._px(18), self._px(6)))
+                  style="Muted.TLabel").pack(
+            side="left", padx=(self._px(GAP_WIDE), self._px(GAP)))
         combo = ttk.Combobox(options, textvariable=self.ungrouped,
                              values=list(UNGROUPED_OPTIONS), state="readonly",
                              width=24)
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", self._schedule_regroup)
 
+        # A drop anywhere on this card sets the destination, which is why the
+        # card is armed rather than just the entry: the entry is a thin strip
+        # and the whole panel is what reads as "the destination".
+        if register_drop_target(body, self._on_destination_dropped):
+            self.dest_hint.config(text="or drop a folder here")
+
     def _build_results(self, edge: int) -> None:
         self.paned = ttk.Panedwindow(self, orient="horizontal")
-        self.paned.pack(fill="both", expand=True, padx=edge, pady=self._px(6))
+        self.paned.pack(fill="both", expand=True, padx=edge,
+                        pady=(0, self._px(GAP_SECTION)))
 
-        left = ttk.Frame(self.paned)
+        left = ttk.Frame(self.paned, style="Card.TFrame")
+        header = ttk.Frame(left, style="TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew",
+                    padx=self._px(PAD_CARD),
+                    pady=(self._px(PAD_CARD), self._px(GAP)))
+        ttk.Label(header, text="GROUPS", style="Legend.TLabel").pack(
+            side="left")
+        self.group_count = ttk.Label(header, text="", style="Muted.TLabel")
+        self.group_count.pack(side="right")
+
         columns = ("original", "match", "folder")
         self.tree = ttk.Treeview(left, columns=columns, show="tree headings",
                                  selectmode="extended")
-        self.tree.heading("#0", text="New name")
-        self.tree.heading("original", text="Original name")
-        self.tree.heading("match", text="Match")
-        self.tree.heading("folder", text="From")
+        # Headings follow their column's own alignment; a centred heading over
+        # left-aligned data reads as a different column to the data.
+        self.tree.heading("#0", text="New name", anchor="w")
+        self.tree.heading("original", text="Original name", anchor="w")
+        self.tree.heading("match", text="Match", anchor="center")
+        self.tree.heading("folder", text="From", anchor="w")
         self.tree.column("#0", width=self._px(150), minwidth=self._px(120),
                          stretch=False)
         self.tree.column("original", width=self._px(190),
@@ -297,10 +337,20 @@ class App(tk.Tk):
 
         ysb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        left.rowconfigure(0, weight=1)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        ysb.grid(row=1, column=1, sticky="ns")
+        left.rowconfigure(1, weight=1)
         left.columnconfigure(0, weight=1)
+
+        # An empty Treeview draws nothing at all, so on a first run the widest
+        # column of the window said less than the preview beside it.  This
+        # label covers the rows only while there are none.
+        self.tree_empty = ttk.Label(
+            self.tree, style="Muted.TLabel", anchor="center", justify="center",
+            text="Albums appear here, with the name each\n"
+                 "copy will be given.\n\n"
+                 "Add source folders, then Analyse.")
+        self._sync_tree_empty()
 
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-1>", self._on_tree_double)
@@ -313,36 +363,40 @@ class App(tk.Tk):
         self.after(120, self._init_sash)
 
     def _build_actions(self, edge: int) -> None:
-        bottom = ttk.Frame(self, style="Window.TFrame")
-        bottom.pack(fill="x", padx=edge, pady=(self._px(6), 0))
+        body = self._card(edge, GAP_SECTION)
+        row = ttk.Frame(body, style="TFrame")
+        row.pack(fill="x")
 
-        ttk.Button(bottom, text="Expand all", style="Secondary.TButton",
-                   command=lambda: self._set_open(True)).pack(side="left")
-        ttk.Button(bottom, text="Collapse all", style="Secondary.TButton",
-                   command=lambda: self._set_open(False)).pack(
-            side="left", padx=self._px(6))
-        self.plan_label = ttk.Label(bottom, text="", style="WindowMuted.TLabel")
-        self.plan_label.pack(side="left", padx=self._px(14))
-
+        # Copying is the app's whole point and it only ever adds files, so it
+        # is the one filled green and sits at the end of the row.
         self.copy_btn = ttk.Button(
-            bottom, text="Copy to destination", style="Go.TButton",
+            row, text="Copy to destination", style="Go.TButton",
             state="disabled", command=self._on_copy_clicked)
         self.copy_btn.pack(side="right")
 
+        ttk.Button(row, text="Expand all", style="Ghost.TButton",
+                   command=lambda: self._set_open(True)).pack(side="left")
+        ttk.Button(row, text="Collapse all", style="Ghost.TButton",
+                   command=lambda: self._set_open(False)).pack(
+            side="left", padx=(self._px(GAP_TIGHT), 0))
+        self.plan_label = ttk.Label(row, text="", style="Muted.TLabel")
+        self.plan_label.pack(side="left", padx=(self._px(GAP_WIDE), 0))
+
     def _build_status(self, edge: int) -> None:
+        tk.Frame(self, background=BORDER, height=1).pack(fill="x")
         bar = ttk.Frame(self, style="Window.TFrame")
-        bar.pack(fill="x", padx=edge, pady=(self._px(8), self._px(12)))
+        bar.pack(fill="x", padx=edge, pady=self._px(GAP_WIDE))
         self.status = tk.StringVar(value=self._summary)
         ttk.Label(bar, textvariable=self.status, anchor="w",
                   style="WindowMuted.TLabel").pack(side="left", fill="x",
                                                    expand=True)
         self.progress = ttk.Progressbar(bar, mode="determinate",
-                                        length=self._px(260))
-        self.progress.pack(side="right", padx=(self._px(14), 0))
+                                        length=self._px(240))
+        self.progress.pack(side="right", padx=(self._px(GAP_WIDE), 0))
 
     def _build_context_menu(self) -> None:
         self.menu = tk.Menu(self, tearoff=0, bg=ELEV, fg=FG,
-                            activebackground=ACCENT, activeforeground="#ffffff",
+                            activebackground=ACCENT, activeforeground=ON_FILL,
                             activeborderwidth=0, bd=0,
                             disabledforeground=FG_MUTED)
         self.menu.add_command(label="Open", command=self._open_selected)
@@ -438,29 +492,23 @@ class App(tk.Tk):
 
     # ---- folders ---------------------------------------------------------- #
     def _folders(self) -> list[str]:
-        return list(self.folder_list.get(0, "end"))
+        return self.folder_panel.folders()
 
-    def _add_folder(self) -> None:
-        existing = self._folders()
-        chosen = filedialog.askdirectory(
-            title="Add a folder of images",
-            initialdir=existing[-1] if existing else None)
-        if not chosen:
-            return
-        folder = os.path.normpath(chosen)
-        if any(os.path.normcase(f) == os.path.normcase(folder)
-               for f in existing):
-            return
-        self.folder_list.insert("end", folder)
+    def _sync_tree_empty(self) -> None:
+        groups = len(self.tree.get_children())
+        if groups:
+            self.tree_empty.place_forget()
+        else:
+            self.tree_empty.place(relx=0.5, rely=0.42, anchor="center")
+        self.group_count.config(
+            text="" if not groups else
+            f"{groups} group" if groups == 1 else f"{groups} groups")
 
-    def _remove_folders(self) -> None:
-        for index in reversed(self.folder_list.curselection()):
-            self.folder_list.delete(index)
-
-    def _on_folder_double(self, _event: tk.Event | None = None) -> None:
-        selection = self.folder_list.curselection()
-        if selection:
-            self._open_path(self.folder_list.get(selection[0]))
+    def _on_folders_changed(self) -> None:
+        count = len(self._folders())
+        self.folder_count.config(
+            text="" if not count else
+            f"{count} folder" if count == 1 else f"{count} folders")
 
     def _pick_destination(self) -> None:
         current = self.destination.get().strip()
@@ -469,6 +517,10 @@ class App(tk.Tk):
             initialdir=current or None)
         if chosen:
             self.destination.set(os.path.normpath(chosen))
+
+    def _on_destination_dropped(self, folders: list[str]) -> None:
+        """Only one folder can be the destination, so take the first."""
+        self.destination.set(folders[0])
 
     # ---- small helpers ---------------------------------------------------- #
     def _on_threshold(self, raw: str) -> None:
@@ -694,6 +746,7 @@ class App(tk.Tk):
         self._group_of_item.clear()
         self._shown_group = None
         self.plan_label.config(text="")
+        self._sync_tree_empty()
         self.gallery.clear_cache()
         self.gallery.show_message("Analyse a folder, then select a group to\n"
                                   "see its images side by side.")
@@ -725,6 +778,7 @@ class App(tk.Tk):
                 self._group_of_item[item] = index
                 total += 1
 
+        self._sync_tree_empty()
         self.plan_label.config(
             text=f"{total:,} file(s) will be written" if total else "")
         self.copy_btn.config(
